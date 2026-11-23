@@ -43,9 +43,9 @@ static void handle_guest_trap(arm_thread_state64_t *ts, uint64_t fault_addr, boo
             else if (sysreg == 0x6088) val = v_hcr;
             else if (sysreg == 0x6108) val = v_vttbr;
             else if (sysreg == 0x5F01) val = timer_get_cntpct();
-            if (rt < 29) regs[rt] = val;
+            if (rt < 29) *(regs + rt) = val;
         } else if ((insn & 0xFFF00000) == 0xD5100000) {
-            uint64_t val = (rt < 29) ? regs[rt] : 0;
+            uint64_t val = (rt < 29) ? *(regs + rt) : 0;
             if (sysreg == 0x4080) v_sctlr = val;
             else if (sysreg == 0x4100) v_ttbr0 = val;
             else if (sysreg == 0x4101) v_ttbr1 = val;
@@ -57,15 +57,19 @@ static void handle_guest_trap(arm_thread_state64_t *ts, uint64_t fault_addr, boo
         }
     } else {
         bool is_write = ((insn >> 22) & 1) == 0;
-        uint64_t val = (rt < 29) ? regs[rt] : 0;
+        uint64_t val = (rt < 29) ? *(regs + rt) : 0;
         if ((fault_addr & ~0xFFFULL) == 0x09000000 && is_write && g_uart_cb) {
             g_uart_cb((char)(val & 0xFF));
         } else if (fault_addr >= 0x08000000ULL && fault_addr < 0x08200000ULL) {
             if (is_write) gic_mmio_write(fault_addr & 0xFFFFULL, val, 4);
-            else if (rt < 29) regs[rt] = gic_mmio_read(fault_addr & 0xFFFFULL, 4);
+            else if (rt < 29) *(regs + rt) = gic_mmio_read(fault_addr & 0xFFFFULL, 4);
         } else if (fault_addr >= 0x0a000000ULL && fault_addr < 0x0a001000ULL) {
             if (is_write) virtio_mmio_write(fault_addr, val, 4);
-            else if (rt < 29) regs[rt] = virtio_mmio_read(fault_addr, 4);
+            else if (rt < 29) *(regs + rt) = virtio_mmio_read(fault_addr, 4);
+        } else if (fault_addr >= 0x40000000ULL && fault_addr < 0x40000000ULL + ram_size) {
+            uint64_t off = fault_addr - 0x40000000ULL;
+            if (is_write) *(uint64_t *)(rw_ram + off) = val;
+            else if (rt < 29) *(regs + rt) = *(uint64_t *)(rw_ram + off);
         }
     }
     arm_thread_state64_set_pc_fptr(*ts, (void *)(pc + 4));
@@ -73,18 +77,18 @@ static void handle_guest_trap(arm_thread_state64_t *ts, uint64_t fault_addr, boo
 
 static void *mach_exc_loop(void *arg) {
     (void)arg;
-    uint8_t buf[1024];
+    uint8_t *buf = (uint8_t *)malloc(2048);
     mach_msg_header_t *hdr = (mach_msg_header_t *)buf;
     while (1) {
-        if (mach_msg(hdr, MACH_RCV_MSG, 0, sizeof(buf), exc_port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL) != KERN_SUCCESS) continue;
+        if (mach_msg(hdr, MACH_RCV_MSG, 0, 2048, exc_port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL) != KERN_SUCCESS) continue;
         uint8_t *body = buf + sizeof(mach_msg_header_t) + sizeof(NDR_record_t);
         exception_type_t exc = *(exception_type_t *)body;
-        int64_t *codes = (int64_t *)(body + 8);
+        uint64_t fault_addr = *(uint64_t *)(body + 16);
         thread_act_t thr = hdr->msgh_remote_port;
         arm_thread_state64_t ts;
         mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
         if (thread_get_state(thr, ARM_THREAD_STATE64, (thread_state_t)&ts, &cnt) == KERN_SUCCESS) {
-            handle_guest_trap(&ts, (uint64_t)codes[1], exc == EXC_BAD_INSTRUCTION);
+            handle_guest_trap(&ts, fault_addr, exc == EXC_BAD_INSTRUCTION);
             thread_set_state(thr, ARM_THREAD_STATE64, (thread_state_t)&ts, ARM_THREAD_STATE64_COUNT);
         }
         struct { mach_msg_header_t Head; NDR_record_t NDR; kern_return_t RetCode; } rep = {
@@ -107,7 +111,7 @@ bool vm_init_and_load(const uint8_t *kernel_data, uint64_t size, const char *dis
         rw_ram = (uint8_t *)rw; rx_ram = (uint8_t *)rx; guest_base_rx = (uint64_t)rx;
     }
     memset(rw_ram, 0, ram_size);
-    if (size >= 2 && kernel_data[0] == 0x1F && kernel_data[1] == 0x8B) {
+    if (size >= 2 && *kernel_data == 0x1F && *(kernel_data + 1) == 0x8B) {
         log_msg("[解壓] 檢測到 GZIP 壓縮內核，正在解壓...\n");
         z_stream strm = { .next_in = (Bytef *)kernel_data, .avail_in = (uInt)size, .next_out = rw_ram, .avail_out = (uInt)(ram_size - 0x100000) };
         if (inflateInit2(&strm, 16 + MAX_WBITS) == Z_OK) { inflate(&strm, Z_FINISH); inflateEnd(&strm); }
@@ -115,13 +119,13 @@ bool vm_init_and_load(const uint8_t *kernel_data, uint64_t size, const char *dis
         memcpy(rw_ram, kernel_data, size < (ram_size - 0x100000) ? size : (ram_size - 0x100000));
     }
     if (*(uint32_t *)(rw_ram + 56) != 0x644d5241) {
-        log_msg("[警告] 非標準 ARM64 Image 檔頭（請確認匯入未壓縮或 GZIP 嘅 arm64 Image），已攔截防閃退。\n");
+        log_msg("[警告] 非標準 ARM64 Image 檔頭，已安全攔截防閃退。\n");
         return false;
     }
     sys_icache_invalidate(rx_ram, ram_size);
     dtb_gpa = build_arm64_dtb(rw_ram, ram_size, ram_size - 0x100000);
     gic_init(); virtio_init(rw_ram, ram_size);
-    if (disk_path && disk_path[0] != '\0') virtio_attach_disk(disk_path);
+    if (disk_path && *disk_path != '\0') virtio_attach_disk(disk_path);
     return true;
 }
 
