@@ -4,9 +4,10 @@ import Darwin
 private var globalEngineRef: VMEngine?
 
 class VMEngine: ObservableObject {
-    @Published var logs: String = "[系統] HengeDebian VHE EL2 引擎已就緒\n"
+    @Published var logs: String = "[系統] HengeDebian 完全體 (VHE EL2 + VirtIO + Metal) 已就緒\n"
     @Published var jitEnabled: Bool = false
     @Published var kernelData: Data?
+    @Published var diskPath: String = ""
 
     init() {
         globalEngineRef = self
@@ -20,7 +21,7 @@ class VMEngine: ObservableObject {
         var flags: UInt32 = 0
         let res = csopsCall(getpid(), 0, &flags, MemoryLayout<UInt32>.size)
         jitEnabled = (res == 0) && ((flags & 0x10000000) != 0)
-        logs += jitEnabled ? "[JIT] CS_DEBUGGED 已開啟！可原生直跑機器碼。\n" : "[JIT] 未開啟 JIT，請用 StikDebug 啟用。\n"
+        logs += jitEnabled ? "[JIT] CS_DEBUGGED 已開啟！原生 ARM64 直跑就緒。\n" : "[JIT] 未開啟 JIT，請用 StikDebug 啟用。\n"
     }
 
     func loadKernel(url: URL) {
@@ -28,28 +29,39 @@ class VMEngine: ObservableObject {
         defer { url.stopAccessingSecurityScopedResource() }
         if let data = try? Data(contentsOf: url) {
             kernelData = data
-            logs += "[載入] 成功讀取 Kernel: \(url.lastPathComponent) (\(data.count / 1024) KB)\n"
+            logs += "[內核] 已載入: \(url.lastPathComponent) (\(data.count / 1024) KB)\n"
         }
     }
 
+    func attachDisk(url: URL) {
+        guard url.startAccessingSecurityScopedResource() else { return }
+        let dst = FileManager.default.temporaryDirectory.appendingPathComponent(url.lastPathComponent)
+        try? FileManager.default.removeItem(at: dst)
+        if (try? FileManager.default.copyItem(at: url, to: dst)) != nil {
+            diskPath = dst.path
+            logs += "[硬碟] VirtIO-Blk 已掛載: \(url.lastPathComponent)\n"
+        }
+        url.stopAccessingSecurityScopedResource()
+    }
+
     func bootRealKernel() {
-        guard jitEnabled else { logs += "[錯誤] 必須先開啟 JIT 先可以執行原生機器碼！\n"; return }
-        guard let data = kernelData else { logs += "[錯誤] 請先點擊「匯入 Debian Kernel」揀選檔案！\n"; return }
-        logs += "[vCPU] 正在將 Kernel 載入 0x40000000 並偽裝為 VHE EL2...\n"
+        guard jitEnabled else { logs += "[錯誤] 請先開啟 JIT！\n"; return }
+        guard let data = kernelData else { logs += "[錯誤] 請先匯入 Debian Kernel！\n"; return }
+        logs += "[vCPU] 分配 256MB RAM、自動生成 DTB 並啟動 VHE EL2...\n"
 
         DispatchQueue.global(qos: .userInitiated).async {
             let ok = data.withUnsafeBytes { rawBuf -> Bool in
                 guard let ptr = rawBuf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
-                return vm_init_and_load(ptr, UInt64(data.count), { c in
-                    let str = String(UnicodeScalar(UInt8(bitPattern: c)))
-                    DispatchQueue.main.async { globalEngineRef?.logs += str }
-                })
+                return self.diskPath.withCString { dPtr in
+                    vm_init_and_load(ptr, UInt64(data.count), dPtr, { c in
+                        let str = String(UnicodeScalar(UInt8(bitPattern: c)))
+                        DispatchQueue.main.async { globalEngineRef?.logs += str }
+                    })
+                }
             }
             if ok {
-                DispatchQueue.main.async { globalEngineRef?.logs += "[vCPU] 跳轉進入原生 ARM64 Kernel 指令流！\n" }
+                DispatchQueue.main.async { globalEngineRef?.logs += "[啟動] 跳轉入原生 Kernel 指令流！\n" }
                 vm_run_vcpu()
-            } else {
-                DispatchQueue.main.async { globalEngineRef?.logs += "[錯誤] mmap 申請記憶體失敗\n" }
             }
         }
     }
