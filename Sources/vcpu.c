@@ -15,11 +15,9 @@ static uint8_t *rw_ram = NULL, *rx_ram = NULL;
 static uint64_t ram_size = 64 * 1024 * 1024, dtb_gpa = 0, guest_base_rx = 0;
 static uart_tx_cb g_uart_cb = NULL;
 static mach_port_t exc_port = MACH_PORT_NULL;
-static volatile bool test_trap_hit = false;
 
 static void log_msg(const char *s) { if (g_uart_cb) while (*s) g_uart_cb(*s++); }
 
-// Apple XNU 內建系統異常派發器宣告
 extern boolean_t mach_exc_server(mach_msg_header_t *InHeadP, mach_msg_header_t *OutHeadP);
 
 kern_return_t catch_mach_exception_raise(
@@ -38,9 +36,8 @@ kern_return_t catch_mach_exception_raise(
     uint64_t *regs = ts.__x;
 
     if (exception == EXC_BAD_INSTRUCTION) {
-        test_trap_hit = true;
         uint32_t sysreg = (insn >> 5) & 0x7FFF;
-        if ((insn & 0xFFF00000) == 0xD5300000) { // MRS
+        if ((insn & 0xFFF00000) == 0xD5300000) {
             uint64_t val = 0;
             if (sysreg == 0x4212) val = (2 << 2);      // CurrentEL = EL2 (0x8)
             else if (sysreg == 0x4020) val = 0x0011;   // EL2 support
@@ -73,7 +70,6 @@ void vm_run_vcpu(void) {
     }
     thread_set_exception_ports(mach_thread_self(), EXC_MASK_BAD_INSTRUCTION | EXC_MASK_BAD_ACCESS, exc_port, EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES, ARM_THREAD_STATE64);
 
-    // 步驟3：先喺最後一頁寫入 2 條原生機器碼實測（MRS X0, CurrentEL; RET），驗證真機直跑與 EL2 攔截！
     uint32_t *test_rw = (uint32_t *)(rw_ram + ram_size - 0x2000);
     uint64_t test_rx = guest_base_rx + ram_size - 0x2000;
     *test_rw = 0xD5384240;       // MRS X0, CurrentEL
@@ -83,7 +79,10 @@ void vm_run_vcpu(void) {
     log_msg("[步驟3] 正在實測原生執行 MRS CurrentEL 並攔截偽裝 EL2...\n");
     uint64_t el_res = 0;
     __asm__ volatile("blr %1\n mov %0, x0\n" : "=r"(el_res) : "r"(test_rx) : "x0", "x30");
-    char msg[96];
-    snprintf(msg, sizeof(msg), "[成功!] 原生機器碼已返回！攔截結果 CurrentEL = 0x%llx (EL%llu)\n", el_res, el_res >> 2);
-    log_msg(msg);
+    char *msg = (char *)malloc(256);
+    if (msg) {
+        snprintf(msg, 256, "[成功!] 原生機器碼已返回！攔截結果 CurrentEL = 0x%llx (EL%llu)\n", el_res, el_res >> 2);
+        log_msg(msg);
+        free(msg);
+    }
 }
