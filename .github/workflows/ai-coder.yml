@@ -15,6 +15,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -28,23 +30,28 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install aider-chat
           git config user.name "AI-Developer-Bot"
-          git config user.email "bot@://github.com"
-          git checkout -b ai-task-${{ github.event.issue.number }}-${{ github.run_id }}
+          git config user.email "bot@users.noreply.github.com"
+          
+          BRANCH_NAME="ai-task-${{ github.event.issue.number }}-${{ github.run_id }}"
+          git checkout -b "$BRANCH_NAME"
 
-          # 使用 OpenRouter 免費頂級編程模型自動寫入代碼
-          aider --model openrouter/qwen/qwen3-coder:free \
+          # 使用 OpenRouter 官方自動免費路由，永遠自動挑選可用嘅頂級免費模型
+          aider --model openrouter/openrouter/free \
                 --yes-always \
                 --no-auto-commits \
                 --message "${{ github.event.issue.title }}: ${{ github.event.issue.body }}"
 
           git add .
           git commit -m "AI Task #${{ github.event.issue.number }}: ${{ github.event.issue.title }}" || echo "No changes"
-          git push origin ai-task-${{ github.event.issue.number }}-${{ github.run_id }}
+          git push -u origin "$BRANCH_NAME"
 
       - name: Create Pull Request
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          BRANCH_NAME="ai-task-${{ github.event.issue.number }}-${{ github.run_id }}"
           gh pr create \
+            --head "$BRANCH_NAME" \
+            --base main \
             --title "AI 自動實作: ${{ github.event.issue.title }}" \
-            --body "AI 已根據 Issue #${{ github.event.issue.number }} 自動完成編碼，請直接點擊下方的 Merge pull request 觸發雲端編譯 iOS IPA。"
+            --body "AI 已根據 Issue #${{ github.event.issue.number }} 自動完成編碼，請直接按 Merge pull request 觸發雲端編譯 iOS IPA。"
