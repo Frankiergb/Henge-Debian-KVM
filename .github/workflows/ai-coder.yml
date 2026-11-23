@@ -1,130 +1,29 @@
 name: OpenRouter AI Auto Coder
-
 on:
   issues:
-    types: [opened, reopened, labeled]
-
+    types: [opened, reopened]
 permissions:
   contents: write
   pull-requests: write
-  issues: write
-
 jobs:
   auto-code:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Run Direct AI Code Generator
-        env:
+      - env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          ISSUE_TITLE: ${{ github.event.issue.title }}
-          ISSUE_BODY: ${{ github.event.issue.body }}
-        run: |
-          pip install requests
-          git config user.name "AI-Developer-Bot"
-          git config user.email "bot@://github.com"
-          
-          BRANCH_NAME="ai-task-${{ github.event.issue.number }}-${{ github.run_id }}"
-          git checkout -b "$BRANCH_NAME"
-
-          python3 - << 'EOF'
-          import os, re, glob, time, requests
-
-          context = ""
-          for path in sorted(glob.glob("**/*", recursive=True)):
-              if os.path.isfile(path) and not path.startswith(".git") and not path.endswith((".png", ".ipa")):
-                  try:
-                      with open(path, "r", encoding="utf-8") as f:
-                          context += f"\n--- EXISTING FILE: {path} ---\n{f.read()}\n"
-                  except Exception:
-                      pass
-
-          prompt = f"""你是一個全自動代碼生成機器人。請根據以下任務要求，直接輸出所有需要創建或修改的完整文件。
-          【嚴格輸出格式要求】：每個文件必須嚴格使用以下格式包裹，不要省略任何代碼，也不要輸出多余的長篇大論：
-          ===FILE: 文件路徑===
-          (完整文件內容)
-          ===END_FILE===
-
-          現有倉庫文件：
-          {context}
-
-          任務標題：{os.environ['ISSUE_TITLE']}
-          任務詳情：{os.environ['ISSUE_BODY']}
-          """
-
-          reply = ""
-          for attempt in range(1, 6):
-              print(f"正在請求 OpenRouter AI (第 {attempt}/5 次嘗試)...")
-              try:
-                  resp = requests.post(
-                      "https://openrouter.ai",
-                      headers={
-                          "Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
-                          "Content-Type": "application/json",
-                          "HTTP-Referer": "https://github.com"
-                      },
-                      json={
-                          "model": "openrouter/free",
-                          "messages": [{"role": "user", "content": prompt}],
-                          "max_tokens": 16000
-                      },
-                      timeout=300
-                  )
-                  print(f"HTTP 狀態碼: {resp.status_code}")
-                  if resp.status_code != 200 or not resp.text.strip():
-                      print(f"伺服器繁忙或空回應: {resp.text[:300]}，10 秒後重試...")
-                      time.sleep(10)
-                      continue
-                  data = resp.json()
-                  if "choices" in data and data["choices"][0]["message"].get("content"):
-                      reply = data["choices"][0]["message"]["content"]
-                      break
-                  else:
-                      print("回傳結構異常:", str(data)[:300])
-              except Exception as e:
-                  print(f"請求異常: {e}，10 秒後重試...")
-              time.sleep(10)
-
-          if not reply:
-              print("5 次嘗試均未能獲取有效回覆，請稍後再試。")
-              exit(1)
-
-          files = re.findall(r"===FILE:\s*(.+?)\s*===\n(.*?)\n===END_FILE===", reply, re.DOTALL)
-          if not files:
-              print("AI 未按格式輸出文件，原始回覆預覽：\n", reply[:2000])
-              exit(1)
-
-          for filepath, content in files:
-              filepath = filepath.strip()
-              content = re.sub(r"^```[a-zA-Z0-9]*\n", "", content)
-              content = re.sub(r"\n```$", "", content)
-              if os.path.dirname(filepath):
-                  os.makedirs(os.path.dirname(filepath), exist_ok=True)
-              with open(filepath, "w", encoding="utf-8") as f:
-                  f.write(content + "\n")
-              print(f"成功寫入文件: {filepath}")
-          EOF
-
-          git add .
-          git commit -m "AI Task #${{ github.event.issue.number }}: ${{ github.event.issue.title }}"
-          git push -u origin "$BRANCH_NAME"
-
-      - name: Create Pull Request
-        env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BRANCH_NAME="ai-task-${{ github.event.issue.number }}-${{ github.run_id }}"
-          gh pr create \
-            --head "$BRANCH_NAME" \
-            --base main \
-            --title "AI 自動實作: ${{ github.event.issue.title }}" \
-            --body "AI 已自動寫入所有代碼文件，請直接按 Merge pull request 觸發雲端編譯 iOS IPA。"
+          pip install aider-chat
+          git config user.name "AI-Bot"
+          git config user.email "bot@://github.com"
+          BR="ai-${{ github.event.issue.number }}-${{ github.run_id }}"
+          git checkout -b "$BR"
+          aider --model openrouter/meta-llama/llama-3.3-70b-instruct:free --edit-format whole --yes-always --no-auto-commits --message "${{ github.event.issue.title }}: ${{ github.event.issue.body }}"
+          git add .
+          git commit -m "AI #${{ github.event.issue.number }}"
+          git push -u origin "$BR"
+          gh pr create --head "$BR" --base main --title "AI: ${{ github.event.issue.title }}" --body "Done"
