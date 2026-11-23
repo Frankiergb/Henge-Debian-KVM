@@ -8,15 +8,18 @@ targets:
     type: application
     platform: iOS
     sources:
-      - path: Sources
+      - path: .
+        excludes:
+          - ".github/**"
+          - "*.md"
+          - "*.yml"
+          - ".gitignore"
+          - ".aider*"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.frankiergb.HengeDebian
-        INFOPLIST_FILE: Info.plist
-        CODE_SIGN_ENTITLEMENTS: Entitlements.plist
         GENERATE_INFOPLIST_FILE: YES
         CODE_SIGN_STYLE: Manual
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO
         CODE_SIGN_IDENTITY: ""
-        SWIFT_OBJC_BRIDGING_HEADER: Sources/HengeDebian-Bridging-Header.h
