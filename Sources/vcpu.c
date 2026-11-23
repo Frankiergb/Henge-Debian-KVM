@@ -3,8 +3,19 @@
 #include <string.h>
 #include <signal.h>
 #include <sys/mman.h>
-#include <sys/ucontext.h>
-#include <mach/arm/_structs.h>
+#include <mach/mach.h>
+
+typedef struct {
+    uint64_t esr;
+    uint64_t far;
+    uint64_t pc;
+    uint32_t cpsr;
+    uint32_t pad;
+    uint64_t x[29];
+    uint64_t fp;
+    uint64_t lr;
+    uint64_t sp;
+} ios_mcontext_t;
 
 static uint8_t *guest_ram = NULL;
 static uint64_t ram_size = 64 * 1024 * 1024;
@@ -12,11 +23,18 @@ static uart_tx_cb g_uart_cb = NULL;
 static uint64_t v_vbar_el1 = 0, v_sctlr_el1 = 0, v_tcr_el1 = 0, v_ttbr0 = 0, v_ttbr1 = 0, v_hcr_el2 = 0x80000000;
 
 static void handle_sigill(int sig, siginfo_t *info, void *uap) {
-    ucontext_t *uc = (ucontext_t *)uap;
-    uint64_t pc = uc->uc_mcontext->__ss.__pc;
-    uint32_t insn = *(uint32_t *)pc;
+    struct __darwin_ucontext {
+        int uc_onstack;
+        uint32_t uc_sigmask;
+        struct { void *ss_sp; size_t ss_size; int ss_flags; } uc_stack;
+        void *uc_link;
+        size_t uc_mcsize;
+        ios_mcontext_t *uc_mcontext;
+    } *uc = (struct __darwin_ucontext *)uap;
+
+    ios_mcontext_t *mc = uc->uc_mcontext;
+    uint32_t insn = *(uint32_t *)mc->pc;
     int rt = insn & 0x1F;
-    uint64_t *regs = uc->uc_mcontext->__ss.__x;
 
     if ((insn & 0xFFF00000) == 0xD5300000) {
         uint32_t sysreg = (insn >> 5) & 0x7FFF;
@@ -27,10 +45,12 @@ static void handle_sigill(int sig, siginfo_t *info, void *uap) {
         else if (sysreg == 0x4600) val = v_vbar_el1;
         else if (sysreg == 0x4080) val = v_sctlr_el1;
         else if (sysreg == 0x6088) val = v_hcr_el2;
-        if (rt < 31) regs[rt] = val;
+        if (rt < 29) mc->x[rt] = val;
+        else if (rt == 29) mc->fp = val;
+        else if (rt == 30) mc->lr = val;
     } else if ((insn & 0xFFF00000) == 0xD5100000) {
         uint32_t sysreg = (insn >> 5) & 0x7FFF;
-        uint64_t val = (rt < 31) ? regs[rt] : 0;
+        uint64_t val = (rt < 29) ? mc->x[rt] : (rt == 29 ? mc->fp : (rt == 30 ? mc->lr : 0));
         if (sysreg == 0x4600) v_vbar_el1 = val;
         else if (sysreg == 0x4080) v_sctlr_el1 = val;
         else if (sysreg == 0x4100) v_ttbr0 = val;
@@ -38,18 +58,28 @@ static void handle_sigill(int sig, siginfo_t *info, void *uap) {
         else if (sysreg == 0x4102) v_tcr_el1 = val;
         else if (sysreg == 0x6088) v_hcr_el2 = val;
     }
-    uc->uc_mcontext->__ss.__pc += 4;
+    mc->pc += 4;
 }
 
 static void handle_sigsegv(int sig, siginfo_t *info, void *uap) {
-    ucontext_t *uc = (ucontext_t *)uap;
+    struct __darwin_ucontext {
+        int uc_onstack;
+        uint32_t uc_sigmask;
+        struct { void *ss_sp; size_t ss_size; int ss_flags; } uc_stack;
+        void *uc_link;
+        size_t uc_mcsize;
+        ios_mcontext_t *uc_mcontext;
+    } *uc = (struct __darwin_ucontext *)uap;
+
+    ios_mcontext_t *mc = uc->uc_mcontext;
     uint64_t addr = (uint64_t)info->si_addr;
-    uint32_t insn = *(uint32_t *)uc->uc_mcontext->__ss.__pc;
+    uint32_t insn = *(uint32_t *)mc->pc;
     int rt = insn & 0x1F;
     if ((addr & ~0xFFFULL) == 0x09000000 && g_uart_cb) {
-        if (rt < 31) g_uart_cb((char)(uc->uc_mcontext->__ss.__x[rt] & 0xFF));
+        uint64_t val = (rt < 29) ? mc->x[rt] : (rt == 29 ? mc->fp : (rt == 30 ? mc->lr : 0));
+        g_uart_cb((char)(val & 0xFF));
     }
-    uc->uc_mcontext->__ss.__pc += 4;
+    mc->pc += 4;
 }
 
 bool vm_init_and_load(const uint8_t *kernel_data, uint64_t size, uart_tx_cb cb) {
