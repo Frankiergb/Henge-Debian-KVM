@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <zlib.h>
 #include <mach/mach.h>
 #include <mach/vm_map.h>
 #include <libkern/OSCacheControl.h>
@@ -16,8 +17,11 @@ static uint64_t v_sctlr = 0, v_ttbr0 = 0, v_ttbr1 = 0, v_hcr = 0x80000000, v_vtt
 static bool in_l2_guest = false;
 static mach_port_t exc_port = MACH_PORT_NULL;
 
+static void log_msg(const char *s) { if (g_uart_cb) while (*s) g_uart_cb(*s++); }
+
 static void handle_guest_trap(arm_thread_state64_t *ts, uint64_t fault_addr, bool is_insn_fault) {
     uint64_t pc = (uint64_t)ts->__pc;
+    if (pc < guest_base_rx || pc >= guest_base_rx + ram_size) return;
     uint32_t insn = *(uint32_t *)pc;
     int rt = insn & 0x1F;
     uint64_t *regs = &ts->__x;
@@ -58,10 +62,6 @@ static void handle_guest_trap(arm_thread_state64_t *ts, uint64_t fault_addr, boo
         } else if (fault_addr >= 0x0a000000ULL && fault_addr < 0x0a001000ULL) {
             if (is_write) virtio_mmio_write(fault_addr, val, 4);
             else if (rt < 29) *(regs + rt) = virtio_mmio_read(fault_addr, 4);
-        } else if (fault_addr >= 0x40000000ULL && fault_addr < 0x40000000ULL + ram_size) {
-            uint64_t off = fault_addr - 0x40000000ULL;
-            if (is_write) *(uint64_t *)(rw_ram + off) = val;
-            else if (rt < 29) *(regs + rt) = *(uint64_t *)(rw_ram + off);
         }
     }
     ts->__pc = pc + 4;
@@ -69,23 +69,24 @@ static void handle_guest_trap(arm_thread_state64_t *ts, uint64_t fault_addr, boo
 
 static void *mach_exc_loop(void *arg) {
     (void)arg;
-    struct { mach_msg_header_t Head; NDR_record_t NDR; exception_type_t exception; mach_msg_type_number_t codeCnt; int64_t code0; int64_t code1; int flavor; mach_msg_type_number_t old_stateCnt; natural_t pad; } msg;
+    uint8_t buf[1024];
+    mach_msg_header_t *hdr = (mach_msg_header_t *)buf;
     while (1) {
-        if (mach_msg(&msg.Head, MACH_RCV_MSG, 0, sizeof(msg), exc_port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL) != KERN_SUCCESS) continue;
-        thread_act_t thr = msg.Head.msgh_remote_port;
+        if (mach_msg(hdr, MACH_RCV_MSG, 0, sizeof(buf), exc_port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL) != KERN_SUCCESS) continue;
+        uint8_t *body = buf + sizeof(mach_msg_header_t) + sizeof(NDR_record_t);
+        exception_type_t exc = *(exception_type_t *)body;
+        int64_t *codes = (int64_t *)(body + 8);
+        thread_act_t thr = hdr->msgh_remote_port;
         arm_thread_state64_t ts;
         mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
-        thread_get_state(thr, ARM_THREAD_STATE64, (thread_state_t)&ts, &cnt);
-        handle_guest_trap(&ts, (uint64_t)msg.code1, msg.exception == EXC_BAD_INSTRUCTION);
-        thread_set_state(thr, ARM_THREAD_STATE64, (thread_state_t)&ts, ARM_THREAD_STATE64_COUNT);
-
-        struct { mach_msg_header_t Head; NDR_record_t NDR; kern_return_t RetCode; } rep;
-        rep.Head.msgh_bits = MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(msg.Head.msgh_bits), 0);
-        rep.Head.msgh_size = sizeof(rep);
-        rep.Head.msgh_remote_port = msg.Head.msgh_remote_port;
-        rep.Head.msgh_local_port = MACH_PORT_NULL;
-        rep.Head.msgh_id = msg.Head.msgh_id + 100;
-        rep.NDR = NDR_record; rep.RetCode = KERN_SUCCESS;
+        if (thread_get_state(thr, ARM_THREAD_STATE64, (thread_state_t)&ts, &cnt) == KERN_SUCCESS) {
+            handle_guest_trap(&ts, (uint64_t)*(codes + 1), exc == EXC_BAD_INSTRUCTION);
+            thread_set_state(thr, ARM_THREAD_STATE64, (thread_state_t)&ts, ARM_THREAD_STATE64_COUNT);
+        }
+        struct { mach_msg_header_t Head; NDR_record_t NDR; kern_return_t RetCode; } rep = {
+            .Head = { .msgh_bits = MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(hdr->msgh_bits), 0), .msgh_size = sizeof(rep), .msgh_remote_port = thr, .msgh_id = hdr->msgh_id + 100 },
+            .NDR = NDR_record, .RetCode = KERN_SUCCESS
+        };
         mach_msg(&rep.Head, MACH_SEND_MSG, sizeof(rep), 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
     }
     return NULL;
@@ -102,7 +103,14 @@ bool vm_init_and_load(const uint8_t *kernel_data, uint64_t size, const char *dis
         rw_ram = (uint8_t *)rw; rx_ram = (uint8_t *)rx; guest_base_rx = (uint64_t)rx;
     }
     memset(rw_ram, 0, ram_size);
-    memcpy(rw_ram, kernel_data, size < (ram_size - 0x100000) ? size : (ram_size - 0x100000));
+    if (size >= 2 && *kernel_data == 0x1F && *(kernel_data + 1) == 0x8B) {
+        log_msg("[解壓] 檢測到 GZIP 壓縮 vmlinuz，正在解壓 ARM64 Image...\n");
+        z_stream strm = { .next_in = (Bytef *)kernel_data, .avail_in = (uInt)size, .next_out = rw_ram, .avail_out = (uInt)(ram_size - 0x100000) };
+        if (inflateInit2(&strm, 16 + MAX_WBITS) == Z_OK) { inflate(&strm, Z_FINISH); inflateEnd(&strm); }
+    } else {
+        memcpy(rw_ram, kernel_data, size < (ram_size - 0x100000) ? size : (ram_size - 0x100000));
+    }
+    if (*(uint32_t *)(rw_ram + 56) != 0x644d5241) { log_msg("[警告] 非標準 ARM64 Image 檔頭，停止跳轉防閃退。\n"); return false; }
     sys_icache_invalidate(rx_ram, ram_size);
     dtb_gpa = build_arm64_dtb(rw_ram, ram_size, ram_size - 0x100000);
     gic_init(); virtio_init(rw_ram, ram_size);
