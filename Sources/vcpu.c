@@ -3,7 +3,8 @@
 #include <string.h>
 #include <signal.h>
 #include <sys/mman.h>
-#include <ucontext.h>
+#include <sys/ucontext.h>
+#include <mach/arm/_structs.h>
 
 static uint8_t *guest_ram = NULL;
 static uint64_t ram_size = 64 * 1024 * 1024;
@@ -15,9 +16,9 @@ static void handle_sigill(int sig, siginfo_t *info, void *uap) {
     uint64_t pc = uc->uc_mcontext->__ss.__pc;
     uint32_t insn = *(uint32_t *)pc;
     int rt = insn & 0x1F;
-    uint64_t *regs = &uc->uc_mcontext->__ss.__x[0];
+    uint64_t *regs = uc->uc_mcontext->__ss.__x;
 
-    if ((insn & 0xFFF00000) == 0xD5300000) { // MRS (讀取系統暫存器)
+    if ((insn & 0xFFF00000) == 0xD5300000) {
         uint32_t sysreg = (insn >> 5) & 0x7FFF;
         uint64_t val = 0;
         if (sysreg == 0x4212) val = (2 << 2);      // CurrentEL = EL2 (0x8)
@@ -27,7 +28,7 @@ static void handle_sigill(int sig, siginfo_t *info, void *uap) {
         else if (sysreg == 0x4080) val = v_sctlr_el1;
         else if (sysreg == 0x6088) val = v_hcr_el2;
         if (rt < 31) regs[rt] = val;
-    } else if ((insn & 0xFFF00000) == 0xD5100000) { // MSR (寫入系統暫存器)
+    } else if ((insn & 0xFFF00000) == 0xD5100000) {
         uint32_t sysreg = (insn >> 5) & 0x7FFF;
         uint64_t val = (rt < 31) ? regs[rt] : 0;
         if (sysreg == 0x4600) v_vbar_el1 = val;
@@ -45,7 +46,7 @@ static void handle_sigsegv(int sig, siginfo_t *info, void *uap) {
     uint64_t addr = (uint64_t)info->si_addr;
     uint32_t insn = *(uint32_t *)uc->uc_mcontext->__ss.__pc;
     int rt = insn & 0x1F;
-    if ((addr & ~0xFFFULL) == 0x09000000 && g_uart_cb) { // PL011 UART 串口輸出
+    if ((addr & ~0xFFFULL) == 0x09000000 && g_uart_cb) {
         if (rt < 31) g_uart_cb((char)(uc->uc_mcontext->__ss.__x[rt] & 0xFF));
     }
     uc->uc_mcontext->__ss.__pc += 4;
@@ -69,5 +70,5 @@ bool vm_init_and_load(const uint8_t *kernel_data, uint64_t size, uart_tx_cb cb) 
 void vm_run_vcpu(void) {
     if (!guest_ram) return;
     void (*entry)(uint64_t, uint64_t, uint64_t, uint64_t) = (void *)guest_ram;
-    entry(0, 0, 0, 0); // 真正跳轉入原生 ARM64 Kernel 機器碼執行！
+    entry(0, 0, 0, 0);
 }
