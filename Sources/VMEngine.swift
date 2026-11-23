@@ -1,9 +1,6 @@
 import Foundation
 import Darwin
 
-@_silgen_name("csops")
-func csops(_ pid: pid_t, _ ops: UInt32, _ useraddr: UnsafeMutableRawPointer?, _ usersize: Int) -> Int32
-
 class VMEngine: ObservableObject {
     @Published var logs: String = "[系統] HengeDebian VHE EL2 引擎已就緒\n"
     @Published var jitEnabled: Bool = false
@@ -13,12 +10,19 @@ class VMEngine: ObservableObject {
     }
 
     func checkJIT() {
+        typealias CsopsFunc = @convention(c) (pid_t, UInt32, UnsafeMutableRawPointer?, Int) -> Int32
+        guard let handle = dlopen(nil, RTLD_NOW),
+              let sym = dlsym(handle, "csops") else {
+            logs += "[JIT] 無法讀取系統 csops 接口\n"
+            return
+        }
+        let csopsCall = unsafeBitCast(sym, to: CsopsFunc.self)
         var flags: UInt32 = 0
-        let CS_OPS_STATUS: UInt32 = 0
-        let CS_DEBUGGED: UInt32 = 0x10000000
-        let res = csops(getpid(), CS_OPS_STATUS, &flags, MemoryLayout<UInt32>.size)
-        jitEnabled = (res == 0) && ((flags & CS_DEBUGGED) != 0)
-        logs += jitEnabled ? "[JIT] 成功檢測到 CS_DEBUGGED 權限！可進行原生直跑。\n" : "[JIT] 未開啟 JIT，請透過 StikDebug / SideStore 啟用。\n"
+        let res = csopsCall(getpid(), 0, &flags, MemoryLayout<UInt32>.size)
+        jitEnabled = (res == 0) && ((flags & 0x10000000) != 0)
+        logs += jitEnabled
+            ? "[JIT] 成功檢測到 CS_DEBUGGED 權限！可進行原生直跑。\n"
+            : "[JIT] 未開啟 JIT，請透過 StikDebug / SideStore 啟用。\n"
     }
 
     func bootTest() {
