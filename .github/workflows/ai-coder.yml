@@ -37,9 +37,8 @@ jobs:
           git checkout -b "$BRANCH_NAME"
 
           python3 - << 'EOF'
-          import os, re, glob, requests
+          import os, re, glob, time, requests
 
-          # 讀取現有倉庫代碼作為上下文
           context = ""
           for path in sorted(glob.glob("**/*", recursive=True)):
               if os.path.isfile(path) and not path.startswith(".git") and not path.endswith((".png", ".ipa")):
@@ -50,7 +49,7 @@ jobs:
                       pass
 
           prompt = f"""你是一個全自動代碼生成機器人。請根據以下任務要求，直接輸出所有需要創建或修改的完整文件。
-          【嚴格輸出格式要求】：每個文件必須嚴格使用以下格式包裹，不要省略任何代碼：
+          【嚴格輸出格式要求】：每個文件必須嚴格使用以下格式包裹，不要省略任何代碼，也不要輸出多余的長篇大論：
           ===FILE: 文件路徑===
           (完整文件內容)
           ===END_FILE===
@@ -62,33 +61,50 @@ jobs:
           任務詳情：{os.environ['ISSUE_BODY']}
           """
 
-          resp = requests.post(
-              "https://openrouter.ai",
-              headers={
-                  "Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
-                  "Content-Type": "application/json"
-              },
-              json={
-                  "model": "openrouter/free",
-                  "messages": [{"role": "user", "content": prompt}],
-                  "max_tokens": 16000
-              },
-              timeout=300
-          )
-          data = resp.json()
-          if "choices" not in data:
-              print("API Error:", data)
+          reply = ""
+          for attempt in range(1, 6):
+              print(f"正在請求 OpenRouter AI (第 {attempt}/5 次嘗試)...")
+              try:
+                  resp = requests.post(
+                      "https://openrouter.ai",
+                      headers={
+                          "Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
+                          "Content-Type": "application/json",
+                          "HTTP-Referer": "https://github.com"
+                      },
+                      json={
+                          "model": "openrouter/free",
+                          "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": 16000
+                      },
+                      timeout=300
+                  )
+                  print(f"HTTP 狀態碼: {resp.status_code}")
+                  if resp.status_code != 200 or not resp.text.strip():
+                      print(f"伺服器繁忙或空回應: {resp.text[:300]}，10 秒後重試...")
+                      time.sleep(10)
+                      continue
+                  data = resp.json()
+                  if "choices" in data and data["choices"][0]["message"].get("content"):
+                      reply = data["choices"][0]["message"]["content"]
+                      break
+                  else:
+                      print("回傳結構異常:", str(data)[:300])
+              except Exception as e:
+                  print(f"請求異常: {e}，10 秒後重試...")
+              time.sleep(10)
+
+          if not reply:
+              print("5 次嘗試均未能獲取有效回覆，請稍後再試。")
               exit(1)
 
-          reply = data["choices"][0]["message"]["content"]
           files = re.findall(r"===FILE:\s*(.+?)\s*===\n(.*?)\n===END_FILE===", reply, re.DOTALL)
           if not files:
-              print("AI 未按格式輸出文件，原始回覆：\n", reply[:2000])
+              print("AI 未按格式輸出文件，原始回覆預覽：\n", reply[:2000])
               exit(1)
 
           for filepath, content in files:
               filepath = filepath.strip()
-              # 去掉可能多餘的 markdown 代碼塊標記
               content = re.sub(r"^```[a-zA-Z0-9]*\n", "", content)
               content = re.sub(r"\n```$", "", content)
               if os.path.dirname(filepath):
