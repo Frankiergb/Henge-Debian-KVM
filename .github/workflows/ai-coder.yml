@@ -1,0 +1,44 @@
+name: OpenRouter AI Auto Coder
+
+on:
+  issues:
+    types: [opened, labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  auto-code:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install and Run Aider with OpenRouter
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          pip install aider-chat
+          git config user.name "AI-Developer-Bot"
+          git config user.email "bot@://github.com"
+          git checkout -b ai-task-${{ github.event.issue.number }}
+
+          # 使用 OpenRouter 免費頂級編程模型自動寫入代碼
+          aider --model openrouter/qwen/qwen3-coder:free \
+                --yes-always \
+                --no-auto-commits \
+                --message "${{ github.event.issue.title }}: ${{ github.event.issue.body }}"
+
+          git add .
+          git commit -m "AI Task #${{ github.event.issue.number }}: ${{ github.event.issue.title }}" || echo "No changes"
+          git push origin ai-task-${{ github.event.issue.number }}
+
+      - name: Create Pull Request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --title "AI 自動實作: ${{ github.event.issue.title }}" \
+            --body "AI 已根據 Issue #${{ github.event.issue.number }} 自動完成編碼，請直接點擊下方的 Merge pull request 觸發雲端編譯 iOS IPA。"
