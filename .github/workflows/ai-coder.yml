@@ -23,26 +23,83 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install and Run Aider with OpenRouter
+      - name: Run Direct AI Code Generator
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
         run: |
-          python -m pip install --upgrade pip setuptools wheel
-          pip install aider-chat
+          pip install requests
           git config user.name "AI-Developer-Bot"
-          git config user.email "bot@users.noreply.github.com"
+          git config user.email "bot@://github.com"
           
           BRANCH_NAME="ai-task-${{ github.event.issue.number }}-${{ github.run_id }}"
           git checkout -b "$BRANCH_NAME"
 
-          # 使用 OpenRouter 官方自動免費路由，永遠自動挑選可用嘅頂級免費模型
-          aider --model openrouter/openrouter/free \
-                --yes-always \
-                --no-auto-commits \
-                --message "${{ github.event.issue.title }}: ${{ github.event.issue.body }}"
+          python3 - << 'EOF'
+          import os, re, glob, requests
+
+          # 讀取現有倉庫代碼作為上下文
+          context = ""
+          for path in sorted(glob.glob("**/*", recursive=True)):
+              if os.path.isfile(path) and not path.startswith(".git") and not path.endswith((".png", ".ipa")):
+                  try:
+                      with open(path, "r", encoding="utf-8") as f:
+                          context += f"\n--- EXISTING FILE: {path} ---\n{f.read()}\n"
+                  except Exception:
+                      pass
+
+          prompt = f"""你是一個全自動代碼生成機器人。請根據以下任務要求，直接輸出所有需要創建或修改的完整文件。
+          【嚴格輸出格式要求】：每個文件必須嚴格使用以下格式包裹，不要省略任何代碼：
+          ===FILE: 文件路徑===
+          (完整文件內容)
+          ===END_FILE===
+
+          現有倉庫文件：
+          {context}
+
+          任務標題：{os.environ['ISSUE_TITLE']}
+          任務詳情：{os.environ['ISSUE_BODY']}
+          """
+
+          resp = requests.post(
+              "https://openrouter.ai",
+              headers={
+                  "Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
+                  "Content-Type": "application/json"
+              },
+              json={
+                  "model": "openrouter/free",
+                  "messages": [{"role": "user", "content": prompt}],
+                  "max_tokens": 16000
+              },
+              timeout=300
+          )
+          data = resp.json()
+          if "choices" not in data:
+              print("API Error:", data)
+              exit(1)
+
+          reply = data["choices"][0]["message"]["content"]
+          files = re.findall(r"===FILE:\s*(.+?)\s*===\n(.*?)\n===END_FILE===", reply, re.DOTALL)
+          if not files:
+              print("AI 未按格式輸出文件，原始回覆：\n", reply[:2000])
+              exit(1)
+
+          for filepath, content in files:
+              filepath = filepath.strip()
+              # 去掉可能多餘的 markdown 代碼塊標記
+              content = re.sub(r"^```[a-zA-Z0-9]*\n", "", content)
+              content = re.sub(r"\n```$", "", content)
+              if os.path.dirname(filepath):
+                  os.makedirs(os.path.dirname(filepath), exist_ok=True)
+              with open(filepath, "w", encoding="utf-8") as f:
+                  f.write(content + "\n")
+              print(f"成功寫入文件: {filepath}")
+          EOF
 
           git add .
-          git commit -m "AI Task #${{ github.event.issue.number }}: ${{ github.event.issue.title }}" || echo "No changes"
+          git commit -m "AI Task #${{ github.event.issue.number }}: ${{ github.event.issue.title }}"
           git push -u origin "$BRANCH_NAME"
 
       - name: Create Pull Request
@@ -54,4 +111,4 @@ jobs:
             --head "$BRANCH_NAME" \
             --base main \
             --title "AI 自動實作: ${{ github.event.issue.title }}" \
-            --body "AI 已根據 Issue #${{ github.event.issue.number }} 自動完成編碼，請直接按 Merge pull request 觸發雲端編譯 iOS IPA。"
+            --body "AI 已自動寫入所有代碼文件，請直接按 Merge pull request 觸發雲端編譯 iOS IPA。"
