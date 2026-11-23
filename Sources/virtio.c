@@ -1,5 +1,6 @@
 #include "virtio.h"
 #include "gic_timer.h"
+#include <stdlib.h>
 #include <string.h>
 
 extern bool virtio_blk_open(const char *path);
@@ -9,21 +10,25 @@ extern void virtio_snd_gpu_init(void);
 extern void virtio_snd_play_pcm(const uint8_t *pcm, uint32_t len);
 
 static uint8_t *g_ram = NULL;
-static uint32_t v_status, v_qsel, v_qnum, v_last_avail;
-static uint64_t v_desc, v_avail, v_used;
+static uint32_t *v_status = NULL, *v_qsel = NULL, *v_qnum = NULL, *v_last_avail = NULL;
+static uint64_t *v_desc = NULL, *v_avail = NULL, *v_used = NULL;
 
 void virtio_init(uint8_t *ram_base, uint64_t ram_size) {
     (void)ram_size; g_ram = ram_base;
-    memset(v_status, 0, sizeof(v_status)); memset(v_last_avail, 0, sizeof(v_last_avail));
+    if (!v_status) {
+        v_status = calloc(5, 4); v_qsel = calloc(5, 4); v_qnum = calloc(5, 4); v_last_avail = calloc(5, 4);
+        v_desc = calloc(5, 8); v_avail = calloc(5, 8); v_used = calloc(5, 8);
+    }
     virtio_snd_gpu_init();
 }
 
 bool virtio_attach_disk(const char *img_path) { return virtio_blk_open(img_path); }
 
 static void kick_vq(int id) {
+    if (!g_ram || !v_desc) return;
     uint64_t d_pa = *(v_desc + id), a_pa = *(v_avail + id), u_pa = *(v_used + id);
     uint32_t qsz = *(v_qnum + id);
-    if (!g_ram || d_pa < 0x40000000ULL || a_pa < 0x40000000ULL || u_pa < 0x40000000ULL || qsz == 0) return;
+    if (d_pa < 0x40000000ULL || a_pa < 0x40000000ULL || u_pa < 0x40000000ULL || qsz == 0) return;
     uint8_t *desc = g_ram + (d_pa - 0x40000000ULL);
     uint16_t *avail = (uint16_t *)(g_ram + (a_pa - 0x40000000ULL));
     uint16_t *used = (uint16_t *)(g_ram + (u_pa - 0x40000000ULL));
@@ -59,7 +64,7 @@ static void kick_vq(int id) {
 
 uint64_t virtio_mmio_read(uint64_t addr, int size) {
     (void)size; int id = (int)((addr - 0x0a000000ULL) / 0x200ULL); uint64_t off = addr & 0x1FFULL;
-    if (id < 0 || id >= 5) return 0;
+    if (id < 0 || id >= 5 || !v_status) return 0;
     if (off == 0x000) return 0x74726976;
     if (off == 0x004) return 2;
     if (off == 0x008) return (id == 0) ? 2 : (id == 1 ? 1 : (id == 2 ? 25 : (id == 3 ? 16 : 18)));
@@ -71,7 +76,7 @@ uint64_t virtio_mmio_read(uint64_t addr, int size) {
 
 void virtio_mmio_write(uint64_t addr, uint64_t val, int size) {
     (void)size; int id = (int)((addr - 0x0a000000ULL) / 0x200ULL); uint64_t off = addr & 0x1FFULL;
-    if (id < 0 || id >= 5) return;
+    if (id < 0 || id >= 5 || !v_status) return;
     if (off == 0x030) *(v_qsel + id) = (uint32_t)val;
     else if (off == 0x038) *(v_qnum + id) = (uint32_t)val;
     else if (off == 0x050) kick_vq(id);
