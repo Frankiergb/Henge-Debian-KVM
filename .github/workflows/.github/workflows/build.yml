@@ -1,0 +1,45 @@
+name: Build Unsigned iOS IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode Project
+        run: |
+          if [ -f "project.yml" ]; then
+            xcodegen generate
+          fi
+
+      - name: Build Unsigned Archive
+        run: |
+          xcodebuild -scheme HengeDebian \
+            -sdk iphoneos \
+            -configuration Release \
+            -archivePath $RUNNER_TEMP/HengeDebian.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            archive
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -r $RUNNER_TEMP/HengeDebian.xcarchive/Products/Applications/*.app Payload/
+          zip -r HengeDebian-Unsigned.ipa Payload
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HengeDebian-IPA
+          path: HengeDebian-Unsigned.ipa
