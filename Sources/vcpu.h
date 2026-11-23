@@ -6,7 +6,7 @@
 
 typedef void (*uart_tx_cb)(char c);
 
-bool vm_init_and_load(const uint8_t *kernel_data, uint64_t size, uart_tx_cb cb);
+bool vm_init_and_load(const uint8_t *kernel_data, uint64_t size, const char *disk_path, uart_tx_cb cb);
 void vm_run_vcpu(void);
 
 #endif
