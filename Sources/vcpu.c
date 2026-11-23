@@ -4,99 +4,120 @@
 #include "virtio.h"
 #include <stdlib.h>
 #include <string.h>
-#include <signal.h>
-#include <sys/mman.h>
+#include <pthread.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
+#include <mach/vm_map.h>
+#include <libkern/OSCacheControl.h>
 
 static uint8_t *rw_ram = NULL, *rx_ram = NULL;
-static uint64_t ram_size = 128 * 1024 * 1024, dtb_gpa = 0;
+static uint64_t ram_size = 128 * 1024 * 1024, dtb_gpa = 0, guest_base_rx = 0;
 static uart_tx_cb g_uart_cb = NULL;
 static uint64_t v_sctlr = 0, v_ttbr0 = 0, v_ttbr1 = 0, v_hcr = 0x80000000, v_vttbr = 0, v_elr_el2 = 0;
 static bool in_l2_guest = false;
+static mach_port_t exc_port = MACH_PORT_NULL;
 
-static void handle_sigill(int sig, siginfo_t *info, void *uap) {
-    (void)sig; (void)info;
-    ucontext_t *uc = (ucontext_t *)uap;
-    arm_thread_state64_t *ts = &uc->uc_mcontext->__ss;
-    uint64_t pc = arm_thread_state64_get_pc(*ts);
+static void handle_guest_trap(arm_thread_state64_t *ts, uint64_t fault_addr, bool is_insn_fault) {
+    uint64_t pc = (uint64_t)ts->__pc;
     uint32_t insn = *(uint32_t *)pc;
     int rt = insn & 0x1F;
-    uint32_t sysreg = (insn >> 5) & 0x7FFF;
+    uint64_t *regs = &ts->__x;
 
-    if (insn == 0xD69F03E0) { in_l2_guest = true; arm_thread_state64_set_pc_fptr(*ts, (void *)v_elr_el2); return; }
-    else if ((insn & 0xFFF00000) == 0xD5300000) {
-        uint64_t val = 0;
-        if (sysreg == 0x4212) val = in_l2_guest ? (1 << 2) : (2 << 2);
-        else if (sysreg == 0x4000) val = 0x410FD083;
-        else if (sysreg == 0x4001) val = 0x8444C004;
-        else if (sysreg == 0x4020) val = 0x0011;
-        else if (sysreg == 0x4039) val = 0x000100;
-        else if (sysreg == 0x4080) val = v_sctlr;
-        else if (sysreg == 0x6088) val = v_hcr;
-        else if (sysreg == 0x6108) val = v_vttbr;
-        else if (sysreg == 0x5F01) val = timer_get_cntpct();
-        if (rt < 29) ts->__x[rt] = val;
-    } else if ((insn & 0xFFF00000) == 0xD5100000) {
-        uint64_t val = (rt < 29) ? ts->__x[rt] : 0;
-        if (sysreg == 0x4080) v_sctlr = val;
-        else if (sysreg == 0x4100) v_ttbr0 = val;
-        else if (sysreg == 0x4101) v_ttbr1 = val;
-        else if (sysreg == 0x6088) v_hcr = val;
-        else if (sysreg == 0x6108) v_vttbr = val;
-        else if (sysreg == 0x6201) v_elr_el2 = val;
-        else if (sysreg == 0x5F19) timer_write_ctl(val);
-        else if (sysreg == 0x5F1A) timer_write_cval(val);
+    if (is_insn_fault) {
+        uint32_t sysreg = (insn >> 5) & 0x7FFF;
+        if (insn == 0xD69F03E0) { in_l2_guest = true; ts->__pc = v_elr_el2; return; }
+        else if ((insn & 0xFFF00000) == 0xD5300000) {
+            uint64_t val = 0;
+            if (sysreg == 0x4212) val = in_l2_guest ? (1 << 2) : (2 << 2);
+            else if (sysreg == 0x4000) val = 0x410FD083;
+            else if (sysreg == 0x4001) val = 0x8444C004;
+            else if (sysreg == 0x4020) val = 0x0011;
+            else if (sysreg == 0x4039) val = 0x000100;
+            else if (sysreg == 0x4080) val = v_sctlr;
+            else if (sysreg == 0x6088) val = v_hcr;
+            else if (sysreg == 0x6108) val = v_vttbr;
+            else if (sysreg == 0x5F01) val = timer_get_cntpct();
+            if (rt < 29) *(regs + rt) = val;
+        } else if ((insn & 0xFFF00000) == 0xD5100000) {
+            uint64_t val = (rt < 29) ? *(regs + rt) : 0;
+            if (sysreg == 0x4080) v_sctlr = val;
+            else if (sysreg == 0x4100) v_ttbr0 = val;
+            else if (sysreg == 0x4101) v_ttbr1 = val;
+            else if (sysreg == 0x6088) v_hcr = val;
+            else if (sysreg == 0x6108) v_vttbr = val;
+            else if (sysreg == 0x6201) v_elr_el2 = val;
+            else if (sysreg == 0x5F19) timer_write_ctl(val);
+            else if (sysreg == 0x5F1A) timer_write_cval(val);
+        }
+    } else {
+        bool is_write = ((insn >> 22) & 1) == 0;
+        uint64_t val = (rt < 29) ? *(regs + rt) : 0;
+        if ((fault_addr & ~0xFFFULL) == 0x09000000 && is_write && g_uart_cb) g_uart_cb((char)(val & 0xFF));
+        else if (fault_addr >= 0x08000000ULL && fault_addr < 0x08200000ULL) {
+            if (is_write) gic_mmio_write(fault_addr & 0xFFFFULL, val, 4);
+            else if (rt < 29) *(regs + rt) = gic_mmio_read(fault_addr & 0xFFFFULL, 4);
+        } else if (fault_addr >= 0x0a000000ULL && fault_addr < 0x0a001000ULL) {
+            if (is_write) virtio_mmio_write(fault_addr, val, 4);
+            else if (rt < 29) *(regs + rt) = virtio_mmio_read(fault_addr, 4);
+        } else if (fault_addr >= 0x40000000ULL && fault_addr < 0x40000000ULL + ram_size) {
+            uint64_t off = fault_addr - 0x40000000ULL;
+            if (is_write) *(uint64_t *)(rw_ram + off) = val;
+            else if (rt < 29) *(regs + rt) = *(uint64_t *)(rw_ram + off);
+        }
     }
-    arm_thread_state64_set_pc_fptr(*ts, (void *)(pc + 4));
+    ts->__pc = pc + 4;
 }
 
-static void handle_fault(int sig, siginfo_t *info, void *uap) {
-    (void)sig;
-    ucontext_t *uc = (ucontext_t *)uap;
-    arm_thread_state64_t *ts = &uc->uc_mcontext->__ss;
-    uint64_t pc = arm_thread_state64_get_pc(*ts);
-    uint64_t addr = (uint64_t)info->si_addr;
-    uint32_t insn = *(uint32_t *)pc;
-    int rt = insn & 0x1F;
-    bool is_write = ((insn >> 22) & 1) == 0;
-    uint64_t val = (rt < 29) ? ts->__x[rt] : 0;
+static void *mach_exc_loop(void *arg) {
+    (void)arg;
+    struct { mach_msg_header_t Head; NDR_record_t NDR; exception_type_t exception; mach_msg_type_number_t codeCnt; int64_t code0; int64_t code1; int flavor; mach_msg_type_number_t old_stateCnt; natural_t pad; } msg;
+    while (1) {
+        if (mach_msg(&msg.Head, MACH_RCV_MSG, 0, sizeof(msg), exc_port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL) != KERN_SUCCESS) continue;
+        thread_act_t thr = msg.Head.msgh_remote_port;
+        arm_thread_state64_t ts;
+        mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+        thread_get_state(thr, ARM_THREAD_STATE64, (thread_state_t)&ts, &cnt);
+        handle_guest_trap(&ts, (uint64_t)msg.code1, msg.exception == EXC_BAD_INSTRUCTION);
+        thread_set_state(thr, ARM_THREAD_STATE64, (thread_state_t)&ts, ARM_THREAD_STATE64_COUNT);
 
-    if ((addr & ~0xFFFULL) == 0x09000000 && is_write && g_uart_cb) g_uart_cb((char)(val & 0xFF));
-    else if (addr >= 0x08000000ULL && addr < 0x08200000ULL) {
-        if (is_write) gic_mmio_write(addr & 0xFFFFULL, val, 4);
-        else if (rt < 29) ts->__x[rt] = gic_mmio_read(addr & 0xFFFFULL, 4);
-    } else if (addr >= 0x0a000000ULL && addr < 0x0a001000ULL) {
-        if (is_write) virtio_mmio_write(addr, val, 4);
-        else if (rt < 29) ts->__x[rt] = virtio_mmio_read(addr, 4);
+        struct { mach_msg_header_t Head; NDR_record_t NDR; kern_return_t RetCode; } rep;
+        rep.Head.msgh_bits = MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(msg.Head.msgh_bits), 0);
+        rep.Head.msgh_size = sizeof(rep);
+        rep.Head.msgh_remote_port = msg.Head.msgh_remote_port;
+        rep.Head.msgh_local_port = MACH_PORT_NULL;
+        rep.Head.msgh_id = msg.Head.msgh_id + 100;
+        rep.NDR = NDR_record; rep.RetCode = KERN_SUCCESS;
+        mach_msg(&rep.Head, MACH_SEND_MSG, sizeof(rep), 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
     }
-    arm_thread_state64_set_pc_fptr(*ts, (void *)(pc + 4));
+    return NULL;
 }
 
 bool vm_init_and_load(const uint8_t *kernel_data, uint64_t size, const char *disk_path, uart_tx_cb cb) {
     g_uart_cb = cb; in_l2_guest = false;
     if (!rw_ram) {
-        mach_vm_address_t rw = 0, rx = 0;
-        if (mach_vm_allocate(mach_task_self(), &rw, ram_size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) return false;
+        vm_address_t rw = 0, rx = 0;
+        if (vm_allocate(mach_task_self(), &rw, ram_size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) return false;
         vm_prot_t cur, max;
-        if (mach_vm_remap(mach_task_self(), &rx, ram_size, 0, VM_FLAGS_ANYWHERE, mach_task_self(), rw, FALSE, &cur, &max, VM_INHERIT_NONE) != KERN_SUCCESS) return false;
-        mach_vm_protect(mach_task_self(), rx, ram_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-        rw_ram = (uint8_t *)rw; rx_ram = (uint8_t *)rx;
+        if (vm_remap(mach_task_self(), &rx, ram_size, 0, VM_FLAGS_ANYWHERE, mach_task_self(), rw, FALSE, &cur, &max, VM_INHERIT_NONE) != KERN_SUCCESS) return false;
+        vm_protect(mach_task_self(), rx, ram_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+        rw_ram = (uint8_t *)rw; rx_ram = (uint8_t *)rx; guest_base_rx = (uint64_t)rx;
     }
     memset(rw_ram, 0, ram_size);
     memcpy(rw_ram, kernel_data, size < (ram_size - 0x100000) ? size : (ram_size - 0x100000));
+    sys_icache_invalidate(rx_ram, ram_size);
     dtb_gpa = build_arm64_dtb(rw_ram, ram_size, ram_size - 0x100000);
     gic_init(); virtio_init(rw_ram, ram_size);
     if (disk_path && *disk_path != '\0') virtio_attach_disk(disk_path);
-
-    struct sigaction sa1 = { .sa_sigaction = handle_sigill, .sa_flags = SA_SIGINFO }; sigaction(SIGILL, &sa1, NULL);
-    struct sigaction sa2 = { .sa_sigaction = handle_fault, .sa_flags = SA_SIGINFO };
-    sigaction(SIGSEGV, &sa2, NULL); sigaction(SIGBUS, &sa2, NULL);
     return true;
 }
 
 void vm_run_vcpu(void) {
     if (!rx_ram) return;
-    void (*entry)(uint64_t, uint64_t, uint64_t, uint64_t) = (void *)rx_ram;
-    entry(dtb_gpa, 0, 0, 0);
+    if (exc_port == MACH_PORT_NULL) {
+        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &exc_port);
+        mach_port_insert_right(mach_task_self(), exc_port, exc_port, MACH_MSG_TYPE_MAKE_SEND);
+        pthread_t th; pthread_create(&th, NULL, mach_exc_loop, NULL);
+    }
+    thread_set_exception_ports(mach_thread_self(), EXC_MASK_BAD_INSTRUCTION | EXC_MASK_BAD_ACCESS, exc_port, EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES, ARM_THREAD_STATE64);
+    uint64_t entry = guest_base_rx, dtb = dtb_gpa;
+    __asm__ volatile("mov x0, %0\n mov x1, xzr\n mov x2, xzr\n mov x3, xzr\n br %1\n" : : "r"(dtb), "r"(entry) : "x0", "x1", "x2", "x3");
 }
