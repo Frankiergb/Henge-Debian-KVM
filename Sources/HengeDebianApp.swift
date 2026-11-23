@@ -3,43 +3,48 @@ import UniformTypeIdentifiers
 
 @main
 struct HengeDebianApp: App {
-    var body: some Scene {
-        WindowGroup { ContentView() }
-    }
+    var body: some Scene { WindowGroup { ContentView() } }
 }
 
 struct ContentView: View {
     @StateObject private var vm = VMEngine()
+    @State private var pickerMode = 0 // 1=Kernel, 2=Disk
     @State private var showPicker = false
+    @State private var showMetal = false
 
     var body: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 10) {
             HStack {
-                Text("HengeDebian (EL2 KVM)").font(.headline)
+                Text("HengeDebian KVM").font(.headline)
                 Spacer()
-                Text(vm.jitEnabled ? "JIT 已開啟" : "未開 JIT")
-                    .font(.caption.bold()).padding(6)
+                Button(showMetal ? "切去終端機" : "Metal GPU 畫面") { showMetal.toggle() }
+                    .font(.caption).buttonStyle(.bordered)
+                Text(vm.jitEnabled ? "JIT ON" : "NO JIT")
+                    .font(.caption.bold()).padding(5)
                     .background(vm.jitEnabled ? Color.green.opacity(0.2) : Color.red.opacity(0.2))
                     .foregroundColor(vm.jitEnabled ? .green : .red).cornerRadius(6)
             }.padding(.horizontal)
 
-            ScrollView {
-                Text(vm.logs)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundColor(.green)
-                    .frame(maxWidth: .infinity, alignment: .leading).padding(10)
-            }.background(Color.black).cornerRadius(8).padding(.horizontal)
+            if showMetal {
+                MetalScreenView().cornerRadius(8).padding(.horizontal)
+            } else {
+                ScrollView {
+                    Text(vm.logs).font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.green).frame(maxWidth: .infinity, alignment: .leading).padding(10)
+                }.background(Color.black).cornerRadius(8).padding(.horizontal)
+            }
 
-            HStack(spacing: 12) {
-                Button("匯入 Debian Kernel") { showPicker = true }
-                    .buttonStyle(.bordered)
-                Button("原生直跑啟動") { vm.bootRealKernel() }
-                    .buttonStyle(.borderedProminent)
+            HStack(spacing: 8) {
+                Button("1.匯入Kernel") { pickerMode = 1; showPicker = true }.buttonStyle(.bordered)
+                Button("2.掛載硬碟") { pickerMode = 2; showPicker = true }.buttonStyle(.bordered)
+                Button("3.啟動EL2") { vm.bootRealKernel() }.buttonStyle(.borderedProminent)
             }.padding(.bottom)
         }
         .padding(.top)
         .fileImporter(isPresented: $showPicker, allowedContentTypes: [.data, .item]) { res in
-            if case .success(let url) = res { vm.loadKernel(url: url) }
+            if case .success(let url) = res {
+                if pickerMode == 1 { vm.loadKernel(url: url) } else { vm.attachDisk(url: url) }
+            }
         }
     }
 }
