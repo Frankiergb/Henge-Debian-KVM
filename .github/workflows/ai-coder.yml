@@ -2,7 +2,7 @@ name: OpenRouter AI Auto Coder
 
 on:
   issues:
-    types: [opened, labeled]
+    types: [opened, reopened, labeled]
 
 permissions:
   contents: write
@@ -16,14 +16,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Install and Run Aider with OpenRouter
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
+          python -m pip install --upgrade pip setuptools wheel
           pip install aider-chat
           git config user.name "AI-Developer-Bot"
           git config user.email "bot@://github.com"
-          git checkout -b ai-task-${{ github.event.issue.number }}
+          git checkout -b ai-task-${{ github.event.issue.number }}-${{ github.run_id }}
 
           # 使用 OpenRouter 免費頂級編程模型自動寫入代碼
           aider --model openrouter/qwen/qwen3-coder:free \
@@ -33,7 +39,7 @@ jobs:
 
           git add .
           git commit -m "AI Task #${{ github.event.issue.number }}: ${{ github.event.issue.title }}" || echo "No changes"
-          git push origin ai-task-${{ github.event.issue.number }}
+          git push origin ai-task-${{ github.event.issue.number }}-${{ github.run_id }}
 
       - name: Create Pull Request
         env:
